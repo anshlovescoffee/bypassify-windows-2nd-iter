@@ -1,0 +1,9 @@
+cmake_minimum_required(VERSION 3.14)
+add_subdirectory(minhook)
+add_subdirectory(imgui)
+add_subdirectory(client)
+add_subdirectory(dumper)
+add_subdirectory(injector)
+
+set(BUILD_SAMPLE OFF)
+add_subdirectory(DirectXTex)
