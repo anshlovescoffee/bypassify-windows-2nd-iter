@@ -11,6 +11,7 @@ target_sources(
     imagehelper.cpp
 )
 target_include_directories(client INTERFACE .)
+target_include_directories(client PRIVATE ${CMAKE_SOURCE_DIR}/shared)
 target_link_libraries(client PRIVATE minhook imgui shlwapi DirectXTex)
 set_target_properties(
     client

@@ -4,6 +4,7 @@ add_subdirectory(imgui)
 add_subdirectory(client)
 add_subdirectory(dumper)
 add_subdirectory(injector)
+add_subdirectory(bootstrap)
 
 set(BUILD_SAMPLE OFF)
 add_subdirectory(DirectXTex)

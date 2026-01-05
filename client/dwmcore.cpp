@@ -37,11 +37,6 @@ HRESULT __fastcall HookPresent(COverlayContext* pSelf, DwmSwapChain* pDwmSwapCha
         IOverlayMonitorTarget* pMonitorTarget = nullptr;
         D3D11_TEXTURE2D_DESC dxTextureDesc = {};
         float dpiScaling = 1; // fall back to a scale of 1 if unable to query the scale of the monitor
-
-        if (pDwmDevice)
-        {
-            pDxDevice = GetD3D11Device(pDwmDevice);
-        }
         if (pDwmBuffer)
         {
             pDxBuffer = GetD3D11Resource(pDwmBuffer);
@@ -64,7 +59,16 @@ HRESULT __fastcall HookPresent(COverlayContext* pSelf, DwmSwapChain* pDwmSwapCha
                         dpiScaling = dxTextureDesc.Height / CLIENT_TARGET_VIRTUAL_HEIGHT;
                         pDxTexture->Release();
                     }
-                    Client::Initialize(pDxDevice, dpiScaling);
+                    if (pDwmDevice)
+                    {
+                        IUnknown* pUnknown = GetD3D11Device(pDwmDevice);
+                        pUnknown->QueryInterface(__uuidof(ID3D11Device1), (void**)(&pDxDevice));
+                    }
+                    if (pDxDevice)
+                    {
+                        Client::Initialize(pDxDevice, dpiScaling);
+                        pDxDevice->Release();
+                    }
                 }
                 Client::NextFrame(pDxBuffer);
             }
@@ -135,29 +139,29 @@ void DwmCore::TestDraw(ID3D11Device1* pDxDevice, ID3D11Resource* pDxBuffer)
 bool DwmCore::Init()
 {
     dwmcoreBase = reinterpret_cast<uintptr_t>(GetModuleHandleA("dwmcore.dll"));
-    ScheduleCompositionPass = reinterpret_cast<ProtoScheduleCompositionPass>(dwmcoreBase + OffsetScheduleCompositionPass);
-    *(bool*)(dwmcoreBase + OffsetForceDirtyRendering) = true;
+    ScheduleCompositionPass = reinterpret_cast<ProtoScheduleCompositionPass>(dwmcoreBase + OffsetTable[OffsetScheduleCompositionPass]);
+    *(bool*)(dwmcoreBase + OffsetTable[OffsetForceDirtyRendering]) = true;
     if (MH_Initialize() != MH_OK)
     {
         fprintf(stderr, "Unable to initialize MinHook\n");
         return false;
     }
-    if (MH_CreateHook((void*)(dwmcoreBase + OffsetPresent), (void*)HookPresent, (void**)(&OriginalPresent)) != MH_OK)
+    if (MH_CreateHook((void*)(dwmcoreBase + OffsetTable[OffsetPresent]), (void*)HookPresent, (void**)(&OriginalPresent)) != MH_OK)
     {
         fprintf(stderr, "Unable to initialize COverlayContext::Present hook\n");
         return false;
     }
-    if (MH_CreateHook((void*)(dwmcoreBase + OffsetPresentNeeded1), (void*)HookPresentNeeded1, (void**)(&OriginalPresentNeeded1)) != MH_OK)
+    if (MH_CreateHook((void*)(dwmcoreBase + OffsetTable[OffsetPresentNeeded1]), (void*)HookPresentNeeded1, (void**)(&OriginalPresentNeeded1)) != MH_OK)
     {
         fprintf(stderr, "Unable to initialize COverlayContext::PresentNeeded hook\n");
         return false;
     }
-    if (MH_CreateHook((void*)(dwmcoreBase + OffsetPresentNeeded2), (void*)HookPresentNeeded2, (void**)(&OriginalPresentNeeded2)) != MH_OK)
+    if (MH_CreateHook((void*)(dwmcoreBase + OffsetTable[OffsetPresentNeeded2]), (void*)HookPresentNeeded2, (void**)(&OriginalPresentNeeded2)) != MH_OK)
     {
         fprintf(stderr, "Unable to initialize COverlayContext::PresentNeeded hook\n");
         return false;
     }
-    if (MH_CreateHook((void*)(dwmcoreBase + OffsetIsOverlayPrevented), (void*)HookIsOverlayPrevented, (void**)(&OriginalIsOverlayPrevented)) != MH_OK)
+    if (MH_CreateHook((void*)(dwmcoreBase + OffsetTable[OffsetIsOverlayPrevented]), (void*)HookIsOverlayPrevented, (void**)(&OriginalIsOverlayPrevented)) != MH_OK)
     {
         fprintf(stderr, "Unable to initialize CGlobalCompositionSurfaceInfo::IsOverlayPrevented hook\n");
         return false;
@@ -174,37 +178,37 @@ bool DwmCore::Init()
 CD3DDevice* DwmCore::GetDevice(DwmSwapChain* pSwapChain)
 {
     uintptr_t vTable = *(uintptr_t*)(pSwapChain);
-    ProtoGetDevice function = *(ProtoGetDevice*)(vTable + OffsetGetDevice);
+    ProtoGetDevice function = *(ProtoGetDevice*)(vTable + OffsetTable[OffsetGetDevice]);
     return function(pSwapChain);
 }
 
 ISwapChainBuffer* DwmCore::GetPhysicalBackBuffer(DwmSwapChain* pSwapChain)
 {
     uintptr_t vTable = *(uintptr_t*)(pSwapChain);
-    ProtoGetPhysicalBackBuffer function = *(ProtoGetPhysicalBackBuffer*)(vTable + OffsetGetPhysicalBackBuffer);
+    ProtoGetPhysicalBackBuffer function = *(ProtoGetPhysicalBackBuffer*)(vTable + OffsetTable[OffsetGetPhysicalBackBuffer]);
     return function(pSwapChain);
 }
 
 ID3D11Resource* DwmCore::GetD3D11Resource(ISwapChainBuffer* pSwapChainBuffer)
 {
     uintptr_t vTable = *(uintptr_t*)(pSwapChainBuffer);
-    ProtoGetD3D11Resource function = *(ProtoGetD3D11Resource*)(vTable + OffsetGetD3D11Resource);
+    ProtoGetD3D11Resource function = *(ProtoGetD3D11Resource*)(vTable + OffsetTable[OffsetGetD3D11Resource]);
     return function(pSwapChainBuffer);
 }
 
 bool DwmCore::IsPrimaryMonitor(IOverlayMonitorTarget* pTarget)
 {
     uintptr_t vTable = *(uintptr_t*)(pTarget);
-    ProtoIsPrimaryMonitor function = *(ProtoIsPrimaryMonitor*)(vTable + OffsetIsPrimaryMonitor);
+    ProtoIsPrimaryMonitor function = *(ProtoIsPrimaryMonitor*)(vTable + OffsetTable[OffsetIsPrimaryMonitor]);
     return function(pTarget);
 }
 
-ID3D11Device1* DwmCore::GetD3D11Device(CD3DDevice* pDevice)
+IUnknown* DwmCore::GetD3D11Device(CD3DDevice* pDevice)
 {
-    return *(ID3D11Device1**)(pDevice + OffsetD3D11Device);
+    return *(IUnknown**)(pDevice + OffsetTable[OffsetD3D11Device]);
 }
 
 IOverlayMonitorTarget* DwmCore::GetOverlayMonitorTarget(COverlayContext* pContext)
 {
-    return *(IOverlayMonitorTarget**)(pContext + OffsetOverlayMonitorTarget);
+    return *(IOverlayMonitorTarget**)(pContext + OffsetTable[OffsetOverlayMonitorTarget]);
 }

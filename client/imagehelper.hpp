@@ -1,3 +1,8 @@
+/*
+imagehelper.hpp
+Header for the DirectX image screenshot library
+*/
+
 #include <d3d11.h>
 #include <string>
 

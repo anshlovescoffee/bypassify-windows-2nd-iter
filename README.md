@@ -5,7 +5,10 @@ This repository demonstrates how to hook into the dwm.exe process to draw GUI el
 ![Browser Screenshot With Export Window Open](./screenshots/capture3.png)
 
 ## Running The Application
-If you simply want to try the overlay out for yourself, there are pre-built binaries included in this repository in ./binaries which you can run provided you are on Windows version 26200.7429.<br>
+If you simply want to try the overlay out for yourself, there are pre-built binaries included in this repository in ./binaries which you can run. Provided you are on Windows 11 26200.7462, you may simply run runclient.exe as administrator to inject the overlay into DWM. If you are on a different version, update the binaries directory so that all users can read and execute, then run rundumper.exe as administrator. Then, proceed to run runclient.exe as usual.<br>
+
+⚠️ IF THE DUMPER SAYS UNABLE TO INJECT SYMSRV.DLL, DOUBLE CHECK YOUR FOLDER PERMISSIONS. YOU PROBABLY SKIPPED THE STEP WHERE YOU SET THE FOLDER PERMISSIONS, AND AS A RESULT, THE DWM USER DOES NOT HAVE ACCESS TO THE DLLS IN THE BINARIES DIRECTORY. ⚠️<br>
+
 If you want to build the overlay from scratch, you will need the following prerequisites:
 - Being on Windows for x86
 - CMake (Version 3.21 or newer)
@@ -19,12 +22,10 @@ cmake -G "Visual Studio 17 2022" .. --fresh
 cmake --build . --config=Release"
 ```
 
-After building the repository, run injector.exe as administrator and the hook should inject itself into DWM. Note that building for release is recommended as it will reduce the dependencies and the binary size for the hook DLL. Also note that building will fail should you try to use another C++ compiler.
+After building the repository, run runclient.exe as administrator and the hook should inject itself into DWM. Note that building for release is recommended as it will reduce the dependencies and the binary size for the hook DLL. Also note that building will fail should you try to use another C++ compiler.
 
 ## Updating Offsets
-As more Windows updates are released, the DWM binaries will change and the offsets currently in this repository may become obselete. To get the updated offsets, run dumper.exe and an updated version of offsets.cpp should be generated. Copy the contents of the generated offsets.cpp to the offsets.cpp in the client directory and rebuild.<br>
-
-⚠️⚠️ PLEASE NOTE THAT THE DUMPER IS STILL WORK IN PROGRESS AND DOES NOT DUMP ALL OFFSETS. OffsetD3D11Device AND OffsetOverlayMonitorTarget ARE FIXED TO A SET VALUE AND MAY CHANGE ARBITRARILY IN THE FUTURE. ⚠️⚠️
+As more Windows updates are released, the DWM binaries will change and the offsets currently in this repository may become obselete. To get the updated offsets, run rundumper.exe and a list of updated offsets should appear on a DWM console. The program will also automatically patch the latest offsets into the client binary if it is in the same directory as the dumper program.<br>
 
 ## Manually Obtaining Offsets
 To manually obtain all offsets, open your local version of dwmcore.dll into the reverse engineering software of your choice and rebase the image to 0x0. Then, follow these steps to get each offset.

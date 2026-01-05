@@ -36,7 +36,7 @@ namespace DwmCore
     bool IsPrimaryMonitor(IOverlayMonitorTarget* pTarget);
 
     // general getter functions
-    ID3D11Device1* GetD3D11Device(CD3DDevice* pDevice);
+    IUnknown* GetD3D11Device(CD3DDevice* pDevice);
     IOverlayMonitorTarget* GetOverlayMonitorTarget(COverlayContext* pContext);
     
     void TestDraw(ID3D11Device1* pDxDevice, ID3D11Resource* pDxBuffer);

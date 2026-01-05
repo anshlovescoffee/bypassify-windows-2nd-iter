@@ -38,6 +38,7 @@ typedef struct {
 HANDLE getProcessHandle(DWORD dwPid);
 DWORD getProcessId(LPCSTR procName);
 BOOL WINAPI Inject(LPCSTR procName, std::string dllPath, INJECTCONFIG config);
+BOOL WINAPI StandardMap(LPCSTR procName, std::string dllPath);
 
 // functions for interfacing with external processes
 extern "C" NTSTATUS NTAPI NtWriteVirtualMemory(HANDLE hProcess, LPVOID pBaseAddress, LPVOID pBuffer, SIZE_T bytesToWrite, PSIZE_T pBytesWritten);

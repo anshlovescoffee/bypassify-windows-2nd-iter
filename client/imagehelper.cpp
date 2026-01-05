@@ -1,3 +1,8 @@
+/*
+imagehelper.hpp
+DirectX image screenshot library/utility implementation
+*/
+
 #include "imagehelper.hpp"
 #include "DirectXTex.h"
 #include <stdio.h>

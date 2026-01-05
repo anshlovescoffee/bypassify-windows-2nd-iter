@@ -4,323 +4,379 @@ Automation for dissecting dwmcore.dll function locations and structure offsets
 */
 
 #include <windows.h>
+#include <psapi.h>
 #include <iostream>
 #include <fstream>
 #include <dbghelp.h>
-#include <pathcch.h>
-#include <vector>
-#include "offsetblob.h"
+#include <string>
+#include <d3d11_1.h>
+#include <dxgi.h>
 
-typedef struct {
-    WORD offset : 12;
-    WORD type : 4;
-} RELOCATION_INFO;
+#include "offsetidx.h"
+#include "MinHook.h"
 
-typedef struct
+#define POINTER_MAGIC 0x6967696769676967
+
+using COverlayContext = char;
+using DwmSwapChain = char;
+using CD3DDevice = char;
+using ISwapChainBuffer = char;
+using IOverlayMonitorTarget = char;
+
+using ProtoCreateOverlayContext  = void(__fastcall*)(COverlayContext* pThis, IOverlayMonitorTarget* pTarget, bool disableMPO);
+using ProtoQueryInterface = HRESULT(__fastcall*)(void* pThis, GUID uuid, void** pOut);
+using ProtoPresent = uintptr_t(__fastcall*)(COverlayContext*, DwmSwapChain*, unsigned int, uintptr_t, unsigned int, bool*, bool);
+using ProtoGetDevice = CD3DDevice*(__fastcall*)(DwmSwapChain*);
+using ProtoGetPhysicalBackBuffer = ISwapChainBuffer*(__fastcall*)(DwmSwapChain*);
+
+bool g_wantDump = true;
+uintptr_t g_dwmcoreBase = 0;
+uintptr_t g_d3d11Base = 0;
+MODULEINFO g_d3d11ModuleInfo = {};
+uintptr_t g_offsets[MAX_OFFSET];
+char g_pSymbolInfoBuffer[sizeof(SYMBOL_INFO) + (MAX_SYM_NAME - 1) * sizeof(TCHAR)];
+PSYMBOL_INFO g_pSymbolInfo = reinterpret_cast<PSYMBOL_INFO>(g_pSymbolInfoBuffer);
+ProtoPresent OriginalPresent = nullptr;
+
+char g_memoryPool[0x20000]; // large memory pool for when ya just need to create internal objects and don't wanna malloc
+uintptr_t* g_memoryPoolU64 = reinterpret_cast<uintptr_t*>(g_memoryPool);
+
+DWORD GetPointerProtect(void* pointer) // gets protection in a memory region, returning 0 if pointer is invalid
 {
-    char* symbol;
-    uintptr_t address;
-} SymbolDump;
-
-#define GET_DEVICE_INDEX 0
-#define GET_PHYSICAL_BACK_BUFFER_INDEX 1
-#define GET_D3D11_RESOURCE_INDEX 2
-#define IS_PRIMARY_MONITOR_INDEX 3
-#define IS_VALID_INDEX 4
-#define SWAPCHAIN_BUFFER_QUERY_INDEX 5
-#define RENDER_TARGET_QUERY_INDEX 6
-#define PRESENT_INDEX 7
-#define PRESENT_NEEDED_INDEX_1 8
-#define PRESENT_NEEDED_INDEX_2 9
-#define SCHEDULE_COMPOSITION_PASS_INDEX 10
-#define IS_OVERLAY_PREVENTED_INDEX 11
-#define FORCE_FULL_DIRTY_RENDERING_INDEX 12
-
-#define IS_VALID_OFFSET 0x18 // IDeviceResource->IsValid
-
-SymbolDump symbolsToDump[] = {
-    {"dwmcore!COverlaySwapChain::GetDevice", 0}, // used for IDeviceResource::VTable::GetDevice
-    {"dwmcore!CDDisplaySwapChain::GetPhysicalBackBuffer", 0}, // used for IDeviceResource::VTable::GetPhysicalBackBuffer
-    {"dwmcore!CDDisplaySwapChainBuffer::GetD3D11Resource", 0}, // used for ISwapChainBuffer::VTable::GetD3D11Resource
-    {"dwmcore!CDDisplayRenderTarget::IsPrimaryMonitor", 0}, // used for IOverlayMonitorTarget::VTable::IsPrimaryMonitor
-    {"dwmcore!COverlaySwapChain::IsValid", 0}, // used to get DwmSwapChain::IDeviceResource vtable + 0x18
-    {"dwmcore!CLegacySwapChainBuffer::QueryInterface", 0}, // used to get ISwapChainBuffer vtable base
-    {"dwmcore!CDDARenderTarget::QueryInterface", 0}, // used to get IOverlayMonitorTarget vtable base
-    {"dwmcore!COverlayContext::Present", 0},
-    {"dwmcore!CDDisplayRenderTarget::PresentNeeded", 0},
-    {"dwmcore!CLegacyRenderTarget::PresentNeeded", 0},
-    {"dwmcore!ScheduleCompositionPass", 0},
-    {"dwmcore!CGlobalCompositionSurfaceInfo::IsOverlayPrevented", 0},
-    {"dwmcore!CCommonRegistryData::ForceFullDirtyRendering", 0}
-};
-
-uintptr_t minimum(uintptr_t a, uintptr_t b)
-{
-    return (a < b) ? a : b;
-}
-
-// making sure that the CWD is always inside the directory of the dumper no matter where it is run from
-void FixCwd()
-{
-    WCHAR exePath[MAX_PATH];
-    GetModuleFileNameW(NULL, exePath, MAX_PATH);
-    PathCchRemoveFileSpec(exePath, MAX_PATH);
-    SetCurrentDirectoryW(exePath);
-}
-
-int main()
-{
-    uintptr_t dwmcoreBase = reinterpret_cast<uintptr_t>(LoadLibraryA("dwmcore.dll"));
-    HANDLE hProcess = GetCurrentProcess();
-    PIMAGE_DOS_HEADER dosHeader = NULL;
-    PIMAGE_NT_HEADERS ntHeaders = NULL;
-    DWORD64 dwmcoreLoad64 = NULL;
-    IMAGEHLP_MODULE64 moduleInfo = {};
-    SYMBOL_INFO symbolInfo = {};
-    OffsetBlob dumpedOffsets = {};
-
-    uintptr_t vtDeviceResource = 0; // IDeviceResource vtable base
-    std::vector<uintptr_t> swapchainBufferVtBaseCandidates; // ISwapchainBuffer vtable base candidates
-    std::vector<uintptr_t> monitorTargetVtBaseCandidates; // IOverlayMonitorTarget vtable base candidates
-
-    std::vector<uintptr_t> getDeviceFunctionRefs; // all references to COverlaySwapChain::GetDevice
-    uintptr_t getPhysicalBackBufferRef = 0; // CDDisplaySwapChain::GetPhysicalBackBuffer reference in the vtable entries
-    uintptr_t d3d11ResourceFunctionRef = 0; // CDDisplaySwapChainBuffer::GetD3D11Resource reference in the vtable entries
-    uintptr_t isPrimaryMonitorRef = 0; // CDDisplayRenderTarget::IsPrimaryMonitor reference in the vtable entries
-
-    bool isFirstRef = true; // used for vtable offset dumping
-
-    // load dwmcore.dll
-    printf("dwmcore.dll base: 0x%llx\n", dwmcoreBase);
-    if (!dwmcoreBase)
+    MEMORY_BASIC_INFORMATION mbi = {};
+    if (!VirtualQuery(pointer, &mbi, sizeof(MEMORY_BASIC_INFORMATION)))
     {
-        std::cout << "Failed to load dwmcore.dll" << std::endl;
-        return 1;
+        // fprintf(stderr, "Failed to query pointer protect: %d\n", GetLastError());
+        return 0;
+    }
+    return mbi.Protect;
+}
+
+bool IsValidPointer(void* pointer)
+{
+    return GetPointerProtect(pointer) != 0;
+}
+
+bool IsReadOnlyPointer(void* pointer)
+{
+    return GetPointerProtect(pointer) == PAGE_READONLY;
+}
+
+void ExportOffsets()
+{
+    fprintf(stderr, "unsigned long long OffsetTable[MAX_OFFSET] = {\n");
+    fprintf(stderr, "\t0x%x, // OffsetGetDevice\n", g_offsets[OffsetGetDevice]);
+    fprintf(stderr, "\t0x%x, // OffsetGetPhysicalBackBuffer\n", g_offsets[OffsetGetPhysicalBackBuffer]);
+    fprintf(stderr, "\t0x%x, // OffsetGetD3D11Resource\n", g_offsets[OffsetGetD3D11Resource]);
+    fprintf(stderr, "\t0x%x, // OffsetIsPrimaryMonitor\n", g_offsets[OffsetIsPrimaryMonitor]);
+    fprintf(stderr, "\t0x%x, // OffsetPresent\n", g_offsets[OffsetPresent]);
+    fprintf(stderr, "\t0x%x, // OffsetPresentNeeded1\n", g_offsets[OffsetPresentNeeded1]);
+    fprintf(stderr, "\t0x%x, // OffsetPresentNeeded2\n", g_offsets[OffsetPresentNeeded2]);
+    fprintf(stderr, "\t0x%x, // OffsetScheduleCompositionPass\n", g_offsets[OffsetScheduleCompositionPass]);
+    fprintf(stderr, "\t0x%x, // OffsetIsOverlayPrevented\n", g_offsets[OffsetIsOverlayPrevented]);
+    fprintf(stderr, "\t0x%x, // OffsetD3D11Device\n", g_offsets[OffsetD3D11Device]);
+    fprintf(stderr, "\t0x%x, // OffsetOverlayMonitorTarget\n", g_offsets[OffsetOverlayMonitorTarget]);
+    fprintf(stderr, "\t0x%x, // OffsetForceDirtyRendering\n", g_offsets[OffsetForceDirtyRendering]);
+    fprintf(stderr, "}\n");
+
+    std::ofstream blobFile("C:\\DwmDump\\offsets.blob");
+    if (blobFile)
+    {
+        blobFile.write(reinterpret_cast<char*>(&g_offsets), sizeof(g_offsets));
+        blobFile.close();
+    }
+    else
+    {
+        fprintf(stderr, "WARNING! Unable to create offset blob file\n");
+    }
+}
+
+uintptr_t HookPresent(COverlayContext* pThis, DwmSwapChain* pDwmSwapChain, unsigned int a3, uintptr_t a4, unsigned int a5, bool* a6, bool a7)
+{
+    if (g_wantDump && pThis && pDwmSwapChain) // dumper main
+    {
+        HANDLE hProcess = GetCurrentProcess();
+        uintptr_t* vtSwapChain = *reinterpret_cast<uintptr_t**>(pDwmSwapChain);
+        uintptr_t* vtBackBuffer = nullptr;
+        uintptr_t* vtMonitorTarget = nullptr;
+        ISwapChainBuffer* pBackBuffer = nullptr;
+        IOverlayMonitorTarget* pMonitorTarget = nullptr;
+        ProtoQueryInterface*** pDwmDevice_t = nullptr;
+        ID3D11Device1* pDevice = nullptr;
+        
+        g_wantDump = false;
+
+        // OffsetGetDevice
+        if (!SymFromName(hProcess, "dwmcore!COverlaySwapChain::GetDevice", g_pSymbolInfo))
+        {
+            fprintf(stderr, "Failed to get COverlaySwapChain::GetDevice\n");
+            return OriginalPresent(pThis, pDwmSwapChain, a3, a4, a5, a6, a7);
+        }
+        for (int i = 0; i < 0x1000; ++i)
+        {
+            if (vtSwapChain[i] == g_pSymbolInfo->Address)
+            {
+                g_offsets[OffsetGetDevice] = i * 8;
+                pDwmDevice_t = reinterpret_cast<ProtoQueryInterface***>(reinterpret_cast<ProtoGetDevice>(vtSwapChain[i])(pDwmSwapChain));
+                // fprintf(stderr, "OffsetGetDevice: 0x%x\n", g_offsets.OffsetGetDevice);
+                break;
+            }
+        }
+
+        // OffsetGetPhysicalBackBuffer
+        for (int i = 0; i < 0x1000; ++i)
+        {
+            if (!SymFromAddr(hProcess, vtSwapChain[i], 0, g_pSymbolInfo))
+            {
+                continue;
+            }
+
+            std::string symbolName(g_pSymbolInfo->Name);
+            if (symbolName.find("GetPhysicalBackBuffer") != std::string::npos)
+            {
+                g_offsets[OffsetGetPhysicalBackBuffer] = i * 8;
+                pBackBuffer = reinterpret_cast<ProtoGetPhysicalBackBuffer>(vtSwapChain[i])(pDwmSwapChain);
+                // fprintf(stderr, "OffsetGetPhysicalBackBuffer: 0x%x\n", g_offsets.OffsetGetPhysicalBackBuffer);
+                break;
+            }
+        }
+
+        // OffsetGetD3D11Resource
+        if (!pBackBuffer)
+        {
+            fprintf(stderr, "Failed to get swapchain back buffer\n");
+            return OriginalPresent(pThis, pDwmSwapChain, a3, a4, a5, a6, a7);
+        }
+        vtBackBuffer = *reinterpret_cast<uintptr_t**>(pBackBuffer);
+        for (int i = 0; i < 0x1000; ++i)
+        {
+            if (!SymFromAddr(hProcess, vtBackBuffer[i], 0, g_pSymbolInfo))
+            {
+                continue;
+            }
+
+            std::string symbolName(g_pSymbolInfo->Name);
+            if (symbolName.find("GetD3D11Resource") != std::string::npos)
+            {
+                g_offsets[OffsetGetD3D11Resource] = i * 8;
+                // fprintf(stderr, "OffsetGetD3D11Resource: 0x%x\n", g_offsets.OffsetGetD3D11Resource);
+                break;
+            }
+        }
+
+        // OffsetOverlayMonitorTarget
+        if (!SymFromName(hProcess, "dwmcore!COverlayContext::COverlayContext", g_pSymbolInfo))
+        {
+            fprintf(stderr, "Unable to get COverlayContext::COverlayContext\n");
+            return OriginalPresent(pThis, pDwmSwapChain, a3, a4, a5, a6, a7);
+        }
+        memset(g_memoryPool, 0, sizeof(g_memoryPool));
+        reinterpret_cast<ProtoCreateOverlayContext>(g_pSymbolInfo->Address)(g_memoryPool, (IOverlayMonitorTarget*)(POINTER_MAGIC), true);
+        for (int i = 0; i < sizeof(g_memoryPool) / sizeof(uintptr_t); ++i)
+        {
+            if (g_memoryPoolU64[i] == POINTER_MAGIC)
+            {
+                g_offsets[OffsetOverlayMonitorTarget] = i * 8;
+                pMonitorTarget = reinterpret_cast<IOverlayMonitorTarget*>(*reinterpret_cast<uintptr_t*>(pThis + g_offsets[OffsetOverlayMonitorTarget]));
+                // fprintf(stderr, "OffsetOverlayMonitorTarget: 0x%x\n", g_offsets.OffsetOverlayMonitorTarget);
+                break;
+            }
+        }
+
+        // OffsetIsPrimaryMonitor
+        if (!pMonitorTarget)
+        {
+            fprintf(stderr, "Unable to get monitor target\n");
+            return OriginalPresent(pThis, pDwmSwapChain, a3, a4, a5, a6, a7);
+        }
+        vtMonitorTarget = *reinterpret_cast<uintptr_t**>(pMonitorTarget);
+        for (int i = 0; i < 0x1000; ++i)
+        {
+            if (!SymFromAddr(hProcess, vtMonitorTarget[i], 0, g_pSymbolInfo))
+            {
+                continue;
+            }
+
+            std::string symbolName(g_pSymbolInfo->Name);
+            if (symbolName.find("IsPrimaryMonitor") != std::string::npos)
+            {
+                g_offsets[OffsetIsPrimaryMonitor] = i * 8;
+                // fprintf(stderr, "OffsetIsPrimaryMonitor: 0x%x\n", g_offsets.OffsetIsPrimaryMonitor);
+                break;
+            }
+        }
+
+        // OffsetD3D11Device
+        if (!pDwmDevice_t)
+        {
+            fprintf(stderr, "Failed to get CD3DDevice\n");
+            return OriginalPresent(pThis, pDwmSwapChain, a3, a4, a5, a6, a7);
+        }
+        for (int i = 0; i < 0x100; ++i)
+        {
+            // fprintf(stderr, "GetPointerProtect(pDwmDevice_t[%d]) = 0x%x\n", i, GetPointerProtect(pDwmDevice_t[i]));
+            if (GetPointerProtect(pDwmDevice_t[i]) != PAGE_READWRITE)
+            {
+                continue;
+            }
+            if (!IsReadOnlyPointer(pDwmDevice_t[i][0]))
+            {
+                continue;  
+            }
+            if ((reinterpret_cast<uintptr_t>(pDwmDevice_t[i][0]) - g_d3d11Base) > g_d3d11ModuleInfo.SizeOfImage)
+            {
+                continue;
+            }
+            // fprintf(stderr, "%d: d3d11.dll+0x%x\n", i, reinterpret_cast<uintptr_t>(pDwmDevice_t[i][0]) - g_d3d11Base);
+            
+            reinterpret_cast<IUnknown*>(pDwmDevice_t[i])->QueryInterface(__uuidof(ID3D11Device1), (void**)(&pDevice));
+            if (pDevice)
+            {
+                g_offsets[OffsetD3D11Device] = i * 8;
+                // fprintf(stderr, "OffsetD3D11Device: 0x%x\n", g_offsets.OffsetD3D11Device);
+                pDevice->Release();
+                break;
+            }
+        }
+
+        ExportOffsets();
+    }
+    return OriginalPresent(pThis, pDwmSwapChain, a3, a4, a5, a6, a7);
+}
+
+void DumperInit() // dump all offsets that are not struct offsets or vtable offsets
+{
+    uintptr_t dwmcoreLoad64 = 0;
+    uintptr_t d3d11Load64 = 0;
+    HANDLE hProcess = GetCurrentProcess();
+    IMAGEHLP_MODULE64 moduleInfo = {};
+
+    g_dwmcoreBase = reinterpret_cast<uintptr_t>(GetModuleHandleA("dwmcore.dll"));
+    g_d3d11Base = reinterpret_cast<uintptr_t>(GetModuleHandleA("d3d11.dll"));
+
+    // initialize dbghelp
+    if (!g_dwmcoreBase)
+    {
+        fprintf(stderr, "Failed to find dwmcore.dll\n");
+        return;
+    }
+    if (!g_d3d11Base)
+    {
+        fprintf(stderr, "Failed to find d3d11.dll\n");
+        return;
+    }
+    if (!GetModuleInformation(hProcess, reinterpret_cast<HMODULE>(g_d3d11Base), &g_d3d11ModuleInfo, sizeof(MODULEINFO)))
+    {
+        fprintf(stderr, "Failed to get d3d11.dll module info award\n");
+        return;
     }
 
-    // initialize dbghelp engine
     if (!SymInitialize(
         hProcess,
         "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols",
         FALSE
     ))
     {
-        printf("WARNING: Failed to initialize debug helper: %d\n", GetLastError());
-        return 1;
+        fprintf(stderr, "WARNING: Failed to initialize debug helper: %d\n", GetLastError());
+        return;
     }
-    dwmcoreLoad64 = SymLoadModuleEx(hProcess, NULL, "dwmcore.dll", NULL, dwmcoreBase, 0, NULL, 0);
+
+    dwmcoreLoad64 = SymLoadModuleEx(hProcess, NULL, "dwmcore.dll", NULL, g_dwmcoreBase, 0, NULL, 0);
+    // d3d11Load64 = g_SymLoadModuleEx(hProcess, NULL, "d3d11.dll", NULL, g_d3d11Base, 0, NULL, 0);
     moduleInfo.SizeOfStruct = sizeof(moduleInfo);
+    g_pSymbolInfo->SizeOfStruct = sizeof(SYMBOL_INFO);
+    g_pSymbolInfo->MaxNameLen = MAX_SYM_NAME;
+    
     if (!dwmcoreLoad64)
     {
-        std::cout << "Failed to load symbols for dwmcore.dll" << std::endl;
-        return 1;
+        fprintf(stderr, "Failed to load symbols for dwmcore.dll\n");
+        return;
     }
     if (!SymGetModuleInfo64(hProcess, dwmcoreLoad64, &moduleInfo))
     {
-        printf("Failed to load symbols for dwmcore.dll: %d\n", GetLastError());
-        return 1;
+        fprintf(stderr, "Failed to load symbols for dwmcore.dll: %d\n", GetLastError());
+        return;
     }
-
-    // doing a preliminary dump of symbols to find offsets
-    symbolInfo.SizeOfStruct = sizeof(symbolInfo);
-    for (int i = 0; i < sizeof(symbolsToDump) / sizeof(SymbolDump); ++i)
+    // start dumping static symbols
+    if (!SymFromName(hProcess, "dwmcore!COverlayContext::Present", g_pSymbolInfo))
     {
-        if (!SymFromName(hProcess, symbolsToDump[i].symbol, &symbolInfo))
-        {
-            printf("WARNING! Unable to dump symbol %s\n", symbolsToDump[i].symbol);
-        }
-        else
-        {
-            symbolsToDump[i].address = symbolInfo.Address;
-            // printf("%s: 0x%llx\n", symbol.symbol, symbol.address);
-        }
+        fprintf(stderr, "Failed to get OffsetPresent\n");
+        return;
     }
+    g_offsets[OffsetPresent] = g_pSymbolInfo->Address - g_dwmcoreBase;
 
-    // vtable entries are all in the relocation directory so iterate through .reloc to find vtable function pointers
-    dosHeader = (PIMAGE_DOS_HEADER)(dwmcoreBase);
-    ntHeaders = (PIMAGE_NT_HEADERS)(dwmcoreBase + dosHeader->e_lfanew);
-
-    for (
-        PIMAGE_BASE_RELOCATION relocBase = (PIMAGE_BASE_RELOCATION)(dwmcoreBase + ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress);
-        relocBase->VirtualAddress != 0;
-        relocBase = reinterpret_cast<PIMAGE_BASE_RELOCATION>(reinterpret_cast<uintptr_t>(relocBase) + relocBase->SizeOfBlock)
-    )
+    if (!SymFromName(hProcess, "dwmcore!CDDisplayRenderTarget::PresentNeeded", g_pSymbolInfo))
     {
-        UINT relocations = (relocBase->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(RELOCATION_INFO);
-        RELOCATION_INFO* relocation = reinterpret_cast<RELOCATION_INFO*>(relocBase + 1);
-        for (UINT i = 0; i < relocations; ++i, ++relocation)
-        {
-            if ((relocation->type) == IMAGE_REL_BASED_DIR64)
-            {
-                uintptr_t addyu64 = dwmcoreBase + relocBase->VirtualAddress + relocation->offset;
-                uintptr_t* addy = reinterpret_cast<uintptr_t*>(addyu64);
-                uintptr_t addyValue = *addy;
-                if (addyValue == symbolsToDump[IS_VALID_INDEX].address) // found VtDeviceResource base + IS_VALID_OFFSET
-                {
-                    vtDeviceResource = addyu64 - IS_VALID_OFFSET;
-                }
-                else if (addyValue == symbolsToDump[SWAPCHAIN_BUFFER_QUERY_INDEX].address)
-                {
-                    swapchainBufferVtBaseCandidates.push_back(addyu64);
-                }
-                else if (addyValue == symbolsToDump[RENDER_TARGET_QUERY_INDEX].address)
-                {
-                    monitorTargetVtBaseCandidates.push_back(addyu64);
-                }
-                else if (addyValue == symbolsToDump[GET_DEVICE_INDEX].address)
-                {
-                    getDeviceFunctionRefs.push_back(addyu64);
-                }
-                else if (addyValue == symbolsToDump[GET_PHYSICAL_BACK_BUFFER_INDEX].address)
-                {
-                    getPhysicalBackBufferRef = addyu64;
-                }
-                else if (addyValue == symbolsToDump[GET_D3D11_RESOURCE_INDEX].address)
-                {
-                    d3d11ResourceFunctionRef = addyu64;
-                }
-                else if (addyValue == symbolsToDump[IS_PRIMARY_MONITOR_INDEX].address)
-                {
-                    isPrimaryMonitorRef = addyu64;
-                }
-                // printf("Relocation dwmcore.dll+0x%x: 0x%llx\n", relocBase->VirtualAddress + relocation->offset, *addy);
-            }
-            else
-            {
-                // printf("WARNING! Relocation is not Dir64\n");
-            }
-        }
+        fprintf(stderr, "Failed to get OffsetPresentNeeded1\n");
+        return;
     }
+    g_offsets[OffsetPresentNeeded1] = g_pSymbolInfo->Address - g_dwmcoreBase;
 
-    // dumping vtable data (OffsetGetDevice)
-    isFirstRef = true;
-    for (uintptr_t getDeviceCandidate : getDeviceFunctionRefs)
+    if (!SymFromName(hProcess, "dwmcore!CLegacyRenderTarget::PresentNeeded", g_pSymbolInfo))
     {
-        if (getDeviceCandidate < vtDeviceResource)
-        {
-            continue;
-        }
-        if (isFirstRef)
-        {
-            dumpedOffsets.OffsetGetDevice = getDeviceCandidate - vtDeviceResource;
-            isFirstRef = false;
-        }
-        else
-        {
-            dumpedOffsets.OffsetGetDevice = minimum(dumpedOffsets.OffsetGetDevice, getDeviceCandidate - vtDeviceResource);
-        }
+        fprintf(stderr, "Failed to get OffsetPresentNeeded2\n");
+        return;
     }
+    g_offsets[OffsetPresentNeeded2] = g_pSymbolInfo->Address - g_dwmcoreBase;
 
-    // dumping vtable data (OffsetGetPhysicalBackBuffer)
-    dumpedOffsets.OffsetGetPhysicalBackBuffer = getPhysicalBackBufferRef - vtDeviceResource;
-
-    // dumping vtable data (OffsetGetD3D11Resource)
-    isFirstRef = true;
-    for (uintptr_t swapchainBufferVtCandidate : swapchainBufferVtBaseCandidates)
+    if (!SymFromName(hProcess, "dwmcore!ScheduleCompositionPass", g_pSymbolInfo))
     {
-        if (d3d11ResourceFunctionRef < swapchainBufferVtCandidate)
-        {
-            continue;
-        }
-        if (isFirstRef)
-        {
-            dumpedOffsets.OffsetGetD3D11Resource = d3d11ResourceFunctionRef - swapchainBufferVtCandidate;
-            isFirstRef = false;
-        }
-        else
-        {
-            dumpedOffsets.OffsetGetD3D11Resource = minimum(dumpedOffsets.OffsetGetD3D11Resource, d3d11ResourceFunctionRef - swapchainBufferVtCandidate);
-        }
+        fprintf(stderr, "Failed to get OffsetScheduleCompositionPass\n");
+        return;
     }
+    g_offsets[OffsetScheduleCompositionPass] = g_pSymbolInfo->Address - g_dwmcoreBase;
 
-    // dumping vtable data (OffsetIsPrimaryMonitor)
-    isFirstRef = true;
-    for (uintptr_t monitorTargetVtCandidate : monitorTargetVtBaseCandidates)
+    if (!SymFromName(hProcess, "dwmcore!CGlobalCompositionSurfaceInfo::IsOverlayPrevented", g_pSymbolInfo))
     {
-        if (isPrimaryMonitorRef < monitorTargetVtCandidate)
-        {
-            continue;
-        }
-        if (isFirstRef)
-        {
-            dumpedOffsets.OffsetIsPrimaryMonitor = isPrimaryMonitorRef - monitorTargetVtCandidate;
-            isFirstRef = false;
-        }
-        else
-        {
-            dumpedOffsets.OffsetIsPrimaryMonitor = minimum(dumpedOffsets.OffsetIsPrimaryMonitor, isPrimaryMonitorRef - monitorTargetVtCandidate);
-        }
+        fprintf(stderr, "Failed to get OffsetIsOverlayPrevented\n");
+        return;
     }
+    g_offsets[OffsetIsOverlayPrevented] = g_pSymbolInfo->Address - g_dwmcoreBase;
 
-    // dumping static function offsets
-    dumpedOffsets.OffsetPresent = symbolsToDump[PRESENT_INDEX].address - dwmcoreBase;
-    dumpedOffsets.OffsetPresentNeeded1 = symbolsToDump[PRESENT_NEEDED_INDEX_1].address - dwmcoreBase;
-    dumpedOffsets.OffsetPresentNeeded2 = symbolsToDump[PRESENT_NEEDED_INDEX_2].address - dwmcoreBase;
-    dumpedOffsets.OffsetScheduleCompositionPass = symbolsToDump[SCHEDULE_COMPOSITION_PASS_INDEX].address - dwmcoreBase;
-    dumpedOffsets.OffsetIsOverlayPrevented = symbolsToDump[IS_OVERLAY_PREVENTED_INDEX].address - dwmcoreBase;
-    dumpedOffsets.OffsetForceDirtyRendering = symbolsToDump[FORCE_FULL_DIRTY_RENDERING_INDEX].address - dwmcoreBase;
-
-    // undumpable stuff that's mostly stable
-    dumpedOffsets.OffsetD3D11Device = 0x228;
-    dumpedOffsets.OffsetOverlayMonitorTarget = 0x0;
-
-    // display result of dumping
-    printf("OffsetGetDevice: 0x%llx\n", dumpedOffsets.OffsetGetDevice);
-    printf("OffsetGetPhysicalBackBuffer: 0x%llx\n", dumpedOffsets.OffsetGetPhysicalBackBuffer);
-    printf("OffsetGetD3D11Resource: 0x%llx\n", dumpedOffsets.OffsetGetD3D11Resource);
-    printf("OffsetIsPrimaryMonitor: 0x%llx\n", dumpedOffsets.OffsetIsPrimaryMonitor);
-    printf("OffsetPresent: 0x%llx\n", dumpedOffsets.OffsetPresent);
-    printf("OffsetPresentNeeded1: 0x%llx\n", dumpedOffsets.OffsetPresentNeeded1);
-    printf("OffsetPresentNeeded2: 0x%llx\n", dumpedOffsets.OffsetPresentNeeded2);
-    printf("OffsetScheduleCompositionPass: 0x%llx\n", dumpedOffsets.OffsetScheduleCompositionPass);
-    printf("OffsetIsOverlayPrevented: 0x%llx\n", dumpedOffsets.OffsetIsOverlayPrevented);
-    printf("OffsetD3D11Device: 0x%llx\n", dumpedOffsets.OffsetD3D11Device);
-    printf("OffsetOverlayMonitorTarget: 0x%llx\n", dumpedOffsets.OffsetOverlayMonitorTarget);
-    printf("OffsetForceDirtyRendering: 0x%llx\n", dumpedOffsets.OffsetForceDirtyRendering);
-
-    FixCwd();
-
-    // write offsets to blob file
-    std::ofstream blobFile("offsets.blob");
-    if (blobFile)
+    if (!SymFromName(hProcess, "dwmcore!CCommonRegistryData::ForceFullDirtyRendering", g_pSymbolInfo))
     {
-        blobFile.write(reinterpret_cast<char*>(&dumpedOffsets), sizeof(dumpedOffsets));
-        blobFile.close();
+        fprintf(stderr, "Failed to get OffsetForceDirtyRendering\n");
+        return;
     }
-    else
-    {
-        std::cout << "WARNING! Unable to create offset blob file" << std::endl;
-    }
+    g_offsets[OffsetForceDirtyRendering] = g_pSymbolInfo->Address - g_dwmcoreBase;
 
-    // write a pretty offset dump
-    std::ofstream offsetFile("offsets.cpp");
-    if (offsetFile)
+    // hook present function
+    if (MH_Initialize() != MH_OK)
     {
-        offsetFile << "/*" << std::endl;
-        offsetFile << "offsets.cpp" << std::endl;
-        offsetFile << "Value definition for all dwmcore.dll offsets" << std::endl;
-        offsetFile << "*/" << std::endl;
-        offsetFile << std::endl;
-        offsetFile << "#include \"offsets.hpp\"" << std::endl;
-        offsetFile << std::endl;
-        offsetFile << "u64 OffsetGetDevice = 0x" << std::hex << dumpedOffsets.OffsetGetDevice << "; // IDeviceResource::VTable::GetDevice" << std::endl;
-        offsetFile << "u64 OffsetGetPhysicalBackBuffer = 0x" << std::hex << dumpedOffsets.OffsetGetPhysicalBackBuffer << "; // IDeviceResource::VTable::GetPhysicalBackBuffer" << std::endl;
-        offsetFile << "u64 OffsetGetD3D11Resource = 0x" << std::hex << dumpedOffsets.OffsetGetD3D11Resource << "; // ISwapChainBuffer::VTable::GetD3D11Resource" << std::endl;
-        offsetFile << "u64 OffsetIsPrimaryMonitor = 0x" << std::hex << dumpedOffsets.OffsetIsPrimaryMonitor << "; // IOverlayMonitorTarget::VTable::IsPrimaryMonitor" << std::endl;
-        offsetFile << "u64 OffsetPresent = 0x" << std::hex << dumpedOffsets.OffsetPresent << "; // COverlayContext::Present" << std::endl;
-        offsetFile << "u64 OffsetPresentNeeded1 = 0x" << std::hex << dumpedOffsets.OffsetPresentNeeded1 << "; // CDDisplayRenderTarget::PresentNeeded" << std::endl;
-        offsetFile << "u64 OffsetPresentNeeded2 = 0x" << std::hex << dumpedOffsets.OffsetPresentNeeded2 << "; // CLegacyRenderTarget::PresentNeeded" << std::endl;
-        offsetFile << "u64 OffsetScheduleCompositionPass = 0x" << std::hex << dumpedOffsets.OffsetScheduleCompositionPass << "; // ScheduleCompositionPass" << std::endl;
-        offsetFile << "u64 OffsetIsOverlayPrevented = 0x" << std::hex << dumpedOffsets.OffsetIsOverlayPrevented << "; // CGlobalCompositionSurfaceInfo::IsOverlayPrevented" << std::endl;
-        offsetFile << "u64 OffsetD3D11Device = 0x" << std::hex << dumpedOffsets.OffsetD3D11Device << "; // CD3DDevice.pD3D11Device" << std::endl;
-        offsetFile << "u64 OffsetOverlayMonitorTarget = 0x" << std::hex << dumpedOffsets.OffsetOverlayMonitorTarget << "; // COverlayContext.pOverlayMonitorTarget" << std::endl;
-        offsetFile << "u64 OffsetForceDirtyRendering = 0x" << std::hex << dumpedOffsets.OffsetForceDirtyRendering << "; // CCommonRegistryData.ForceFullDirtyRendering" << std::endl;
-        offsetFile.close();
+        fprintf(stderr, "Unable to initialize MinHook\n");
+        return;
     }
-    else
+    if (MH_CreateHook((void*)(g_dwmcoreBase + g_offsets[OffsetPresent]), (void*)HookPresent, (void**)(&OriginalPresent)) != MH_OK)
     {
-        std::cout << "WARNING! Unable to create offset source file" << std::endl;
+        fprintf(stderr, "Unable to initialize COverlayContext::Present hook\n");
+        return;
     }
+    if (MH_EnableHook(MH_ALL_HOOKS) != MH_OK)
+    {
+        fprintf(stderr, "Unable to enable hooks\n");
+        return;
+    }
+}
 
-    return 0;
+BOOL WINAPI DllMain(HMODULE hDll, DWORD dwReason, LPVOID reserved)
+{
+    switch (dwReason)
+    {
+        case DLL_PROCESS_ATTACH:
+            AllocConsole();
+            SetConsoleTitleA("Dumper");
+            freopen("CONOUT$", "w", stderr);
+            DumperInit();
+            break;
+
+        case DLL_THREAD_ATTACH:
+            break;
+
+        case DLL_THREAD_DETACH:
+            break;
+
+        case DLL_PROCESS_DETACH:
+            break;
+    }
+    return TRUE;  // Successful DLL_PROCESS_ATTACH.
 }
