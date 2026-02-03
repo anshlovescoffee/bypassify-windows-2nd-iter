@@ -3,7 +3,7 @@ main.cpp
 Init function for the the DLL
 */
 
-#define ENABLE_DEBUG_CONSOLE 1
+#define ENABLE_DEBUG_CONSOLE 0
 
 #include <windows.h>
 #include <stdio.h>
@@ -24,7 +24,6 @@ BOOL WINAPI DllMain(HMODULE hDll, DWORD dwReason, LPVOID pReserved)
             {
                 return FALSE;
             }
-            fprintf(stderr, "injected or something\n");
             break;
 
         case DLL_THREAD_ATTACH:

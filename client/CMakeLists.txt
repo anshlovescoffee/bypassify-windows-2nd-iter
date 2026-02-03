@@ -9,6 +9,10 @@ target_sources(
     input.cpp
     offsets.cpp
     imagehelper.cpp
+    gpthelper.cpp
+    settings.cpp
+    settings_ui.cpp
+
 )
 target_include_directories(client INTERFACE .)
 target_include_directories(client PRIVATE ${CMAKE_SOURCE_DIR}/shared)

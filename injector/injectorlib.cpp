@@ -24,10 +24,11 @@ DWORD getProcessId(LPCSTR procName) {
     return 0;
 }
 
-HANDLE getProcessHandle(DWORD dwPid) { // opens a handle to a process with a given process ID
+HANDLE getProcessHandle(DWORD dwPid) {
     HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, dwPid);
-    if (hProcess == INVALID_HANDLE_VALUE) { // unable to open process wompwomp
-        return INVALID_HANDLE_VALUE;
+    if (hProcess == NULL) {
+        std::cout << "OpenProcess failed with error: " << GetLastError() << std::endl;
+        return NULL;
     }
     return hProcess;
 }

@@ -36,7 +36,7 @@ BOOL WINAPI StandardMap(LPCSTR procName, std::string dllPath)
         return TRUE;
     }
     HANDLE hProcess = getProcessHandle(dwPid);
-    if (hProcess == INVALID_HANDLE_VALUE) {
+    if (hProcess == NULL) {
         std::cout << "failed to get handle award" << std::endl;
         return TRUE;
     }
