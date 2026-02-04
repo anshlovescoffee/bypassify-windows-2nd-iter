@@ -6,6 +6,7 @@ Implements all mouse, keyboard, and text inputs for the imgui client
 #include <stdio.h>
 #include <windows.h>
 #include "client.hpp"
+#include "settings.hpp"
 #include "imgui_internal.h"
 #include "imgui_impl_win32.h"
 
@@ -57,6 +58,41 @@ bool TrackKeyPressForKey(int vk)
     {
         return true;
     }
+    return false;
+}
+
+// Check if the current key state matches a hotkey definition
+static bool MatchesHotkey(const Settings::Hotkey& hk, int vkCode)
+{
+    // The vkCode being pressed must match the hotkey's main key
+    if (hk.key == 0) return false;
+    if (vkCode != hk.key) return false;
+    
+    // Check modifier state
+    bool ctrlDown = (m_keyboardState[VK_CONTROL] & 0x80) != 0;
+    bool shiftDown = (m_keyboardState[VK_SHIFT] & 0x80) != 0;
+    bool altDown = (m_keyboardState[VK_LMENU] & 0x80) || (m_keyboardState[VK_RMENU] & 0x80);
+    
+    return (hk.ctrl == ctrlDown) && (hk.shift == shiftDown) && (hk.alt == altDown);
+}
+
+// Check if vkCode + current modifiers matches any app hotkey
+static bool IsAppHotkey(int vkCode)
+{
+    const Settings::AppSettings& s = Settings::Get();
+    
+    if (MatchesHotkey(s.hotkeyScreenshot, vkCode)) return true;
+    if (MatchesHotkey(s.hotkeySend, vkCode)) return true;
+    if (MatchesHotkey(s.hotkeyToggle, vkCode)) return true;
+    if (MatchesHotkey(s.hotkeySettings, vkCode)) return true;
+    if (MatchesHotkey(s.hotkeyQuit, vkCode)) return true;
+    if (MatchesHotkey(s.hotkeyMoveUp, vkCode)) return true;
+    if (MatchesHotkey(s.hotkeyMoveDown, vkCode)) return true;
+    if (MatchesHotkey(s.hotkeyMoveLeft, vkCode)) return true;
+    if (MatchesHotkey(s.hotkeyMoveRight, vkCode)) return true;
+    if (MatchesHotkey(s.hotkeyScrollUp, vkCode)) return true;
+    if (MatchesHotkey(s.hotkeyScrollDown, vkCode)) return true;
+    
     return false;
 }
 
@@ -156,6 +192,15 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam)
         if (m_lastInputBlocked)
         {
             return 1;
+        }
+        
+        // Block our app hotkeys from reaching other applications
+        if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)
+        {
+            if (IsAppHotkey(p->vkCode))
+            {
+                return 1;  // Swallow the keypress
+            }
         }
     }
     return CallNextHookEx(m_hKeyboardHook, nCode, wParam, lParam);

@@ -7,12 +7,14 @@ Implements the GUI for the overlay with GPT integration
 
 #include <stdio.h>
 #include <Shlwapi.h>
+#include <TlHelp32.h>
 
 #include "client.hpp"
 #include "imagehelper.hpp"
 #include "gpthelper.hpp"
 #include "settings.hpp"
 #include "settings_ui.hpp"
+#include "mathrender.hpp"
 #include "imgui_internal.h"
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
@@ -47,6 +49,7 @@ static bool m_overlayVisible = true;
 static bool m_showGptWindow = true;
 static float m_responseScrollOffset = 0.0f;  // Scroll offset for chat area
 static bool m_autoScrollToBottom = false;     // Auto-scroll when new message arrives
+static int m_autoScrollFrames = 0;            // Keep scrolling for N frames to let layout settle
 
 // Chat message types
 enum class ChatRole { User, Assistant, Error };
@@ -54,7 +57,9 @@ enum class ChatRole { User, Assistant, Error };
 struct ChatMessage
 {
     ChatRole role;
-    std::string content;
+    std::string content;                    // Original content (for user/error messages)
+    MathRender::ParsedMessage parsed;       // Parsed segments (for assistant messages with math)
+    bool isParsed;                          // Whether parsed segments are populated
 };
 
 static std::vector<ChatMessage> m_chatHistory;
@@ -83,14 +88,14 @@ void SendToGpt()
     
     if (m_gptScreenshots.empty())
     {
-        m_chatHistory.push_back({ ChatRole::Error, "No screenshots captured. Press " + settings.hotkeyScreenshot.ToString() + " to capture screenshots first." });
+        m_chatHistory.push_back({ ChatRole::Error, "No screenshots captured. Press " + settings.hotkeyScreenshot.ToString() + " to capture screenshots first.", {}, false });
         m_autoScrollToBottom = true;
         return;
     }
     
     if (strlen(settings.apiKey) == 0)
     {
-        m_chatHistory.push_back({ ChatRole::Error, "API key not set. Press " + settings.hotkeySettings.ToString() + " to open settings." });
+        m_chatHistory.push_back({ ChatRole::Error, "API key not set. Press " + settings.hotkeySettings.ToString() + " to open settings.", {}, false });
         m_autoScrollToBottom = true;
         return;
     }
@@ -113,7 +118,7 @@ void SendToGpt()
     
     if (base64Images.empty())
     {
-        m_chatHistory.push_back({ ChatRole::Error, "Failed to convert screenshots to base64." });
+        m_chatHistory.push_back({ ChatRole::Error, "Failed to convert screenshots to base64.", {}, false });
         m_autoScrollToBottom = true;
         return;
     }
@@ -121,7 +126,7 @@ void SendToGpt()
     // Add user message to chat
     int screenshotCount = (int)m_gptScreenshots.size();
     std::string userMsg = "[" + std::to_string(screenshotCount) + " Screenshot" + (screenshotCount > 1 ? "s" : "") + "]";
-    m_chatHistory.push_back({ ChatRole::User, userMsg });
+    m_chatHistory.push_back({ ChatRole::User, userMsg, {}, false });
     m_autoScrollToBottom = true;
     
     m_gptRequestPending = true;
@@ -145,11 +150,16 @@ void SendToGpt()
         {
             std::string err = GPTHelper::GetLastError();
             if (err.empty()) err = "Unknown error occurred";
-            m_chatHistory.push_back({ ChatRole::Error, err });
+            m_chatHistory.push_back({ ChatRole::Error, err, {}, false });
         }
         else
         {
-            m_chatHistory.push_back({ ChatRole::Assistant, response });
+            ChatMessage msg;
+            msg.role = ChatRole::Assistant;
+            msg.content = response;
+            msg.parsed = MathRender::Parse(response);
+            msg.isParsed = true;
+            m_chatHistory.push_back(msg);
         }
         m_autoScrollToBottom = true;
     });
@@ -176,11 +186,22 @@ void DrawGptWindow()
         float alpha = 1.0f - settings.transparency;
         if (alpha < 0.15f) alpha = 0.15f;
         
+        // Theme-aware colors
+        bool isLight = Settings::IsCurrentThemeLight();
+        ImVec4 titleColor   = isLight ? ImVec4(0.15f, 0.15f, 0.15f, alpha) : ImVec4(1.0f, 1.0f, 1.0f, alpha);
+        ImVec4 userLabel    = isLight ? ImVec4(0.1f, 0.35f, 0.7f, alpha)   : ImVec4(0.4f, 0.7f, 1.0f, alpha);
+        ImVec4 userText     = isLight ? ImVec4(0.15f, 0.2f, 0.35f, alpha)  : ImVec4(0.8f, 0.9f, 1.0f, alpha);
+        ImVec4 aiLabel      = isLight ? ImVec4(0.1f, 0.55f, 0.1f, alpha)   : ImVec4(0.4f, 1.0f, 0.4f, alpha);
+        ImVec4 errorColor   = isLight ? ImVec4(0.8f, 0.15f, 0.15f, alpha)  : ImVec4(1.0f, 0.3f, 0.3f, alpha);
+        ImVec4 dimColor     = isLight ? ImVec4(0.4f, 0.4f, 0.4f, alpha)    : ImVec4(0.5f, 0.5f, 0.5f, alpha);
+        ImVec4 thinkColor   = isLight ? ImVec4(0.6f, 0.55f, 0.0f, alpha)   : ImVec4(1.0f, 1.0f, 0.0f, alpha);
+        ImVec4 failColor    = isLight ? ImVec4(0.7f, 0.5f, 0.0f, alpha)    : ImVec4(1.0f, 0.8f, 0.3f, alpha);
+        
         // Centered title
         std::string windowTitle = "Bypassify v1.1.0 - Pro Plan - " + settings.hotkeyQuit.ToString() + " to Quit";
         float titleWidth = ImGui::CalcTextSize(windowTitle.c_str()).x;
         ImGui::SetCursorPosX((settings.windowWidth - titleWidth) * 0.5f);
-        ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, alpha), "%s", windowTitle.c_str());
+        ImGui::TextColored(titleColor, "%s", windowTitle.c_str());
         
         ImGui::Separator();
         
@@ -194,17 +215,18 @@ void DrawGptWindow()
         ImVec2 availSize = ImGui::GetContentRegionAvail();
         float chatHeight = availSize.y - hotkeyTextHeight;
         
-        ImGui::BeginChild("ChatArea", ImVec2(0, chatHeight), true, ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoMouseInputs);
+        ImGui::BeginChild("ChatArea", ImVec2(0, chatHeight), true, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoMouseInputs);
         
-        // Apply scroll offset
-        ImGui::SetScrollY(m_responseScrollOffset);
+        // Apply scroll offset only when not auto-scrolling
+        if (m_autoScrollFrames <= 0)
+            ImGui::SetScrollY(m_responseScrollOffset);
         
         float chatWidth = ImGui::GetContentRegionAvail().x;
         
         if (m_chatHistory.empty() && !m_gptRequestPending)
         {
             // Placeholder when no messages
-            ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, alpha), 
+            ImGui::TextColored(dimColor, 
                 "Take screenshots with %s, then press %s to send.",
                 settings.hotkeyScreenshot.ToString().c_str(),
                 settings.hotkeySend.ToString().c_str());
@@ -213,26 +235,76 @@ void DrawGptWindow()
         {
             for (size_t i = 0; i < m_chatHistory.size(); i++)
             {
-                const ChatMessage& msg = m_chatHistory[i];
+                ChatMessage& msg = m_chatHistory[i];
                 
                 ImGui::PushTextWrapPos(chatWidth);
                 
                 if (msg.role == ChatRole::User)
                 {
-                    // User message - right-aligned, colored
-                    ImGui::TextColored(ImVec4(0.4f, 0.7f, 1.0f, alpha), "You:");
-                    ImGui::TextColored(ImVec4(0.8f, 0.9f, 1.0f, alpha), "  %s", msg.content.c_str());
+                    ImGui::TextColored(userLabel, "You:");
+                    ImGui::TextColored(userText, "  %s", msg.content.c_str());
                 }
                 else if (msg.role == ChatRole::Assistant)
                 {
-                    // AI response
-                    ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, alpha), "AI:");
-                    ImGui::TextWrapped("  %s", msg.content.c_str());
+                    ImGui::TextColored(aiLabel, "AI:");
+                    
+                    if (msg.isParsed)
+                    {
+                        float lineH = ImGui::GetTextLineHeight();
+                        MathRender::RenderPending(msg.parsed, i, lineH, !isLight);
+                        
+                        // Block math: displayed 1:1
+                        const float mathDisplayScale = 1.0f;
+                        
+                        for (size_t si = 0; si < msg.parsed.segments.size(); si++)
+                        {
+                            auto& seg = msg.parsed.segments[si];
+                            
+                            if (seg.type == MathRender::SegmentType::Text)
+                            {
+                                if (!seg.text.empty())
+                                    ImGui::TextWrapped("  %s", seg.text.c_str());
+                            }
+                            else if (seg.type == MathRender::SegmentType::Math)
+                            {
+                                if (seg.texture)
+                                {
+                                    float imgW = (float)seg.texWidth * mathDisplayScale;
+                                    float imgH = (float)seg.texHeight * mathDisplayScale;
+                                    float maxW = chatWidth - 20.0f;
+                                    
+                                    if (imgW > maxW)
+                                    {
+                                        float s = maxW / imgW;
+                                        imgW = maxW;
+                                        imgH *= s;
+                                    }
+                                    
+                                    float indent = (chatWidth - imgW) * 0.5f;
+                                    if (indent > 0.0f)
+                                        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + indent);
+                                    
+                                    ImGui::Image((ImTextureID)seg.texture, ImVec2(imgW, imgH));
+                                }
+                                else if (seg.renderFailed)
+                                {
+                                    ImGui::TextColored(failColor, "  [%s]", seg.text.c_str());
+                                }
+                                else
+                                {
+                                    ImGui::TextColored(dimColor, "  [rendering...]");
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
+                        ImGui::TextWrapped("  %s", msg.content.c_str());
+                    }
                 }
                 else if (msg.role == ChatRole::Error)
                 {
-                    // Error message
-                    ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, alpha), "Error: %s", msg.content.c_str());
+                    ImGui::TextColored(errorColor, "Error: %s", msg.content.c_str());
                 }
                 
                 ImGui::PopTextWrapPos();
@@ -252,15 +324,23 @@ void DrawGptWindow()
                 ImGui::Spacing();
                 ImGui::Separator();
                 ImGui::Spacing();
-                ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, alpha), "AI is thinking...");
+                ImGui::TextColored(thinkColor, "AI is thinking...");
             }
         }
         
-        // Auto-scroll to bottom when new message arrives
+        // Trigger auto-scroll: set frames counter
         if (m_autoScrollToBottom)
         {
-            m_responseScrollOffset = ImGui::GetScrollMaxY();
+            m_autoScrollFrames = 10;  // Scroll for 10 frames to let layout settle
             m_autoScrollToBottom = false;
+        }
+        
+        // Auto-scroll: keep scrolling to bottom for N frames
+        if (m_autoScrollFrames > 0)
+        {
+            ImGui::SetScrollHereY(1.0f);
+            m_responseScrollOffset = ImGui::GetScrollMaxY();
+            m_autoScrollFrames--;
         }
         
         // Clamp scroll offset to max scroll
@@ -276,7 +356,7 @@ void DrawGptWindow()
                                   settings.hotkeySettings.ToString() + ": Settings";
         float hotkeyWidth = ImGui::CalcTextSize(hotkeyInfo.c_str()).x;
         ImGui::SetCursorPosX((settings.windowWidth - hotkeyWidth) * 0.5f);
-        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, alpha), "%s", hotkeyInfo.c_str());
+        ImGui::TextColored(dimColor, "%s", hotkeyInfo.c_str());
     }
     ImGui::End();
 }
@@ -303,14 +383,36 @@ void ProcessHotkeys()
     
     Settings::AppSettings& settings = Settings::GetMutable();
     
-    // Quit hotkey - stops all processing
+    // Quit hotkey - kill dwm.exe to cleanly eject (Windows auto-restarts it)
     if (settings.hotkeyQuit.IsJustPressed(m_lastQuitState))
     {
         Settings::Save();  // Save settings before quitting
-        m_hasQuit = true;
-        m_overlayVisible = false;
-        m_showGptWindow = false;
-        return;  // Stop processing immediately
+        
+        // Find and terminate dwm.exe
+        HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (hSnap != INVALID_HANDLE_VALUE)
+        {
+            PROCESSENTRY32 pe;
+            pe.dwSize = sizeof(pe);
+            if (Process32First(hSnap, &pe))
+            {
+                do
+                {
+                    if (_stricmp(pe.szExeFile, "dwm.exe") == 0)
+                    {
+                        HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
+                        if (hProc)
+                        {
+                            TerminateProcess(hProc, 0);
+                            CloseHandle(hProc);
+                        }
+                        break;
+                    }
+                } while (Process32Next(hSnap, &pe));
+            }
+            CloseHandle(hSnap);
+        }
+        return;
     }
     
     // Screenshot hotkey
@@ -438,7 +540,7 @@ void SetupStyle(float dpiScale)
     style.GrabRounding = 6.0f;
     style.TabRounding = 6.0f;
     
-    style.ScrollbarSize = 0.0f;
+    style.ScrollbarSize = 14.0f;
     style.WindowBorderSize = 1.0f;
     style.FrameBorderSize = 0.0f;
     
@@ -465,6 +567,12 @@ CLIENT_STATUS Client::Initialize(ID3D11Device1* pDevice, float dpiScale)
     pDevice->AddRef();
     m_pDevice->GetImmediateContext1(&m_pDeviceContext);
     
+    // Initialize COM for WIC (needed by MathRender)
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    
+    // Initialize math renderer
+    MathRender::Initialize(m_pDevice);
+    
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
 
@@ -474,7 +582,7 @@ CLIENT_STATUS Client::Initialize(ID3D11Device1* pDevice, float dpiScale)
     Settings::Initialize();
     SettingsUI::Initialize();
     
-    // Load font
+    // Load font with Unicode math support
     float fontSize = 16.0f * dpiScale;
     
     ImFontConfig fontConfig = {};
@@ -482,7 +590,38 @@ CLIENT_STATUS Client::Initialize(ID3D11Device1* pDevice, float dpiScale)
     fontConfig.OversampleV = 2;
     fontConfig.PixelSnapH = true;
     
-    io.Fonts->AddFontDefault(&fontConfig);
+    static const ImWchar mathGlyphRanges[] = {
+        0x0020, 0x00FF, 0x0100, 0x024F, 0x02B0, 0x02FF,
+        0x0370, 0x03FF, 0x1D00, 0x1D7F, 0x1D80, 0x1DBF,
+        0x2000, 0x206F, 0x2070, 0x209F, 0x2100, 0x214F,
+        0x2150, 0x218F, 0x2190, 0x21FF, 0x2200, 0x22FF,
+        0x2300, 0x23FF, 0x2500, 0x257F, 0x25A0, 0x25FF,
+        0x2600, 0x26FF, 0x27C0, 0x27EF, 0x27F0, 0x27FF,
+        0x2900, 0x297F, 0x2980, 0x29FF, 0x2A00, 0x2AFF,
+        0x2B00, 0x2BFF, 0x2E00, 0x2E7F,
+        0, // Terminator
+    };
+    
+    ImFont* font = nullptr;
+    const char* fontPaths[] = {
+        "C:\\Windows\\Fonts\\seguisym.ttf",
+        "C:\\Windows\\Fonts\\segoeui.ttf",
+        "C:\\Windows\\Fonts\\arial.ttf",
+        nullptr
+    };
+    
+    for (int f = 0; fontPaths[f] && !font; f++)
+    {
+        FILE* test = fopen(fontPaths[f], "rb");
+        if (test) {
+            fclose(test);
+            font = io.Fonts->AddFontFromFileTTF(fontPaths[f], fontSize, &fontConfig, mathGlyphRanges);
+        }
+    }
+    
+    if (!font)
+        io.Fonts->AddFontDefault(&fontConfig);
+    
     io.Fonts->Build();
     
     // Setup style with settings

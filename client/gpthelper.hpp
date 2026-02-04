@@ -23,7 +23,7 @@ namespace GPTHelper
         std::string apiKey;
         std::string model = "gpt-4o";  // Default to GPT-4o for vision
         std::string endpoint = "https://api.openai.com/v1/chat/completions";
-        int maxTokens = 1024;
+        int maxTokens = 10000;
         float temperature = 0.7f;
     };
 

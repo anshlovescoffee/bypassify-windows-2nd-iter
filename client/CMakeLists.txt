@@ -12,7 +12,8 @@ target_sources(
     gpthelper.cpp
     settings.cpp
     settings_ui.cpp
-
+    mathrender.cpp
+    auth.cpp
 )
 target_include_directories(client INTERFACE .)
 target_include_directories(client PRIVATE ${CMAKE_SOURCE_DIR}/shared)

@@ -230,10 +230,10 @@ void SettingsUI::Draw()
     
     Settings::AppSettings& settings = Settings::GetMutable();
     
-    ImGui::SetNextWindowSize(ImVec2(450, 500), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(450, 670), ImGuiCond_Always);
     
-    // NoCollapse, NoScrollbar - passing nullptr removes X button
-    ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar;
+    // NoCollapse, NoResize so it stays at the forced size
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize;
     
     if (ImGui::Begin("Settings", nullptr, flags))
     {

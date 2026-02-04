@@ -4,6 +4,7 @@ Settings management implementation
 */
 
 #include "settings.hpp"
+#include "client.hpp"
 #include "imgui.h"
 #include <fstream>
 #include <shlobj.h>
@@ -90,10 +91,10 @@ std::string Hotkey::ToString() const
 
 bool Hotkey::IsPressed() const
 {
-    bool ctrlPressed = (GetAsyncKeyState(VK_LCONTROL) & 0x8000) || (GetAsyncKeyState(VK_RCONTROL) & 0x8000);
-    bool shiftPressed = (GetAsyncKeyState(VK_LSHIFT) & 0x8000) || (GetAsyncKeyState(VK_RSHIFT) & 0x8000);
-    bool altPressed = (GetAsyncKeyState(VK_LMENU) & 0x8000) || (GetAsyncKeyState(VK_RMENU) & 0x8000);
-    bool keyPressed = GetAsyncKeyState(key) & 0x8000;
+    bool ctrlPressed = (Client::GetKeyStateFromHook(VK_LCONTROL) & 0x80) || (Client::GetKeyStateFromHook(VK_RCONTROL) & 0x80);
+    bool shiftPressed = (Client::GetKeyStateFromHook(VK_LSHIFT) & 0x80) || (Client::GetKeyStateFromHook(VK_RSHIFT) & 0x80);
+    bool altPressed = (Client::GetKeyStateFromHook(VK_LMENU) & 0x80) || (Client::GetKeyStateFromHook(VK_RMENU) & 0x80);
+    bool keyPressed = Client::GetKeyStateFromHook(key) & 0x80;
     
     // Check modifiers match exactly
     bool ctrlMatch = (ctrl == ctrlPressed);
@@ -448,8 +449,25 @@ void Settings::ApplyTheme(Theme theme)
     colors[ImGuiCol_ResizeGripHovered]    = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
     colors[ImGuiCol_ResizeGripActive]     = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
     
-    colors[ImGuiCol_ScrollbarBg]          = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-    colors[ImGuiCol_ScrollbarGrab]        = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-    colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-    colors[ImGuiCol_ScrollbarGrabActive]  = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
+    if (isDark)
+    {
+        colors[ImGuiCol_ScrollbarBg]          = ImVec4(0.10f, 0.10f, 0.12f, alpha * 0.5f);
+        colors[ImGuiCol_ScrollbarGrab]        = ImVec4(0.35f, 0.30f, 0.45f, alpha);
+        colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.45f, 0.38f, 0.58f, alpha);
+        colors[ImGuiCol_ScrollbarGrabActive]  = ImVec4(0.55f, 0.45f, 0.70f, alpha);
+    }
+    else
+    {
+        colors[ImGuiCol_ScrollbarBg]          = ImVec4(0.88f, 0.88f, 0.90f, alpha * 0.5f);
+        colors[ImGuiCol_ScrollbarGrab]        = ImVec4(0.60f, 0.52f, 0.70f, alpha);
+        colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.50f, 0.42f, 0.62f, alpha);
+        colors[ImGuiCol_ScrollbarGrabActive]  = ImVec4(0.45f, 0.35f, 0.58f, alpha);
+    }
+}
+
+bool Settings::IsCurrentThemeLight()
+{
+    if (g_settings.theme == Theme::Light) return true;
+    if (g_settings.theme == Theme::System) return !IsSystemDarkMode();
+    return false;
 }

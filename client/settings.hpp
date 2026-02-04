@@ -89,4 +89,7 @@ namespace Settings
     
     // Check if system is in dark mode
     bool IsSystemDarkMode();
+    
+    // Check if current active theme is light
+    bool IsCurrentThemeLight();
 }
