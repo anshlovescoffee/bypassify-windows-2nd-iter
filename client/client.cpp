@@ -1,6 +1,7 @@
 /*
 client.cpp
 Implements the GUI for the overlay with GPT integration
+Routes all requests through the backend proxy
 */
 
 #define IMGUI_IMPL_WIN32_DISABLE_GAMEPAD
@@ -51,6 +52,10 @@ static float m_responseScrollOffset = 0.0f;  // Scroll offset for chat area
 static bool m_autoScrollToBottom = false;     // Auto-scroll when new message arrives
 static int m_autoScrollFrames = 0;            // Keep scrolling for N frames to let layout settle
 
+// Model fetch state
+static bool m_modelsFetched = false;
+static bool m_modelsFetching = false;
+
 // Chat message types
 enum class ChatRole { User, Assistant, Error };
 
@@ -70,6 +75,7 @@ static bool m_lastSendState = false;
 static bool m_lastToggleState = false;
 static bool m_lastSettingsState = false;
 static bool m_lastQuitState = false;
+static bool m_lastModelCycleState = false;
 static bool m_hasQuit = false;  // When true, stops ALL processing
 
 // Movement step size in pixels
@@ -93,9 +99,9 @@ void SendToGpt()
         return;
     }
     
-    if (strlen(settings.apiKey) == 0)
+    if (!m_modelsFetched)
     {
-        m_chatHistory.push_back({ ChatRole::Error, "API key not set. Press " + settings.hotkeySettings.ToString() + " to open settings.", {}, false });
+        m_chatHistory.push_back({ ChatRole::Error, "Models not loaded yet. Please wait...", {}, false });
         m_autoScrollToBottom = true;
         return;
     }
@@ -123,17 +129,15 @@ void SendToGpt()
         return;
     }
     
-    // Add user message to chat
+    // Add user message to chat showing model being used
     int screenshotCount = (int)m_gptScreenshots.size();
-    std::string userMsg = "[" + std::to_string(screenshotCount) + " Screenshot" + (screenshotCount > 1 ? "s" : "") + "]";
+    std::string modelName = GPTHelper::GetCurrentModelDisplayName();
+    std::string userMsg = "[" + std::to_string(screenshotCount) + " Screenshot" + (screenshotCount > 1 ? "s" : "") + "] -> " + modelName;
     m_chatHistory.push_back({ ChatRole::User, userMsg, {}, false });
     m_autoScrollToBottom = true;
     
     m_gptRequestPending = true;
     m_gptError.clear();
-    
-    // Set API key and send
-    GPTHelper::SetApiKey(settings.apiKey);
     
     GPTHelper::SendRequestAsync(settings.prompt, base64Images, [](const std::string& response)
     {
@@ -197,8 +201,9 @@ void DrawGptWindow()
         ImVec4 thinkColor   = isLight ? ImVec4(0.6f, 0.55f, 0.0f, alpha)   : ImVec4(1.0f, 1.0f, 0.0f, alpha);
         ImVec4 failColor    = isLight ? ImVec4(0.7f, 0.5f, 0.0f, alpha)    : ImVec4(1.0f, 0.8f, 0.3f, alpha);
         
-        // Centered title
-        std::string windowTitle = "Bypassify v1.1.0 - Pro Plan - " + settings.hotkeyQuit.ToString() + " to Quit";
+        // Centered title with current model name
+        std::string modelDisplay = m_modelsFetched ? GPTHelper::GetCurrentModelDisplayName() : "Loading...";
+        std::string windowTitle = "Bypassify v1.1.0 - " + modelDisplay + " - " + settings.hotkeyQuit.ToString() + " to Quit";
         float titleWidth = ImGui::CalcTextSize(windowTitle.c_str()).x;
         ImGui::SetCursorPosX((settings.windowWidth - titleWidth) * 0.5f);
         ImGui::TextColored(titleColor, "%s", windowTitle.c_str());
@@ -207,8 +212,6 @@ void DrawGptWindow()
         
         // Screenshot count
         ImGui::Text("Screenshots: %d / %d", (int)m_gptScreenshots.size(), MAX_GPT_SCREENSHOTS);
-        
-        ImGui::Separator();
         
         // Chat area - takes up all remaining space minus hotkey bar
         float hotkeyTextHeight = ImGui::GetTextLineHeight();
@@ -230,6 +233,9 @@ void DrawGptWindow()
                 "Take screenshots with %s, then press %s to send.",
                 settings.hotkeyScreenshot.ToString().c_str(),
                 settings.hotkeySend.ToString().c_str());
+            ImGui::TextColored(dimColor,
+                "Press %s to cycle models.",
+                settings.hotkeyModelCycle.ToString().c_str());
         }
         else
         {
@@ -352,6 +358,7 @@ void DrawGptWindow()
         // Centered hotkey instructions at bottom
         std::string hotkeyInfo = settings.hotkeyScreenshot.ToString() + ": Screenshot | " +
                                   settings.hotkeySend.ToString() + ": Send | " +
+                                  settings.hotkeyModelCycle.ToString() + ": Model | " +
                                   settings.hotkeyToggle.ToString() + ": Hide | " +
                                   settings.hotkeySettings.ToString() + ": Settings";
         float hotkeyWidth = ImGui::CalcTextSize(hotkeyInfo.c_str()).x;
@@ -378,6 +385,7 @@ void ProcessHotkeys()
         m_lastToggleState = true;
         m_lastSettingsState = true;
         m_lastQuitState = true;
+        m_lastModelCycleState = true;
         return;
     }
     
@@ -442,6 +450,20 @@ void ProcessHotkeys()
         SettingsUI::Toggle();
     }
     
+    // Model cycle hotkey
+    if (settings.hotkeyModelCycle.IsJustPressed(m_lastModelCycleState))
+    {
+        if (m_modelsFetched && !GPTHelper::GetModels().empty())
+        {
+            std::string newModel = GPTHelper::CycleModel();
+            
+            // Persist the selection
+            strncpy(settings.selectedModelId, GPTHelper::GetCurrentModelId().c_str(), sizeof(settings.selectedModelId) - 1);
+            settings.selectedModelId[sizeof(settings.selectedModelId) - 1] = '\0';
+            Settings::Save(); // Auto-save immediately
+        }
+    }
+    
     // Movement hotkeys - use IsPressed to allow holding
     // Get screen dimensions
     int screenWidth = GetSystemMetrics(SM_CXSCREEN);
@@ -502,6 +524,7 @@ void DrawMenu()
             m_lastToggleState = true;
             m_lastSettingsState = true;
             m_lastQuitState = true;
+            m_lastModelCycleState = true;
             
             ResetEvent(m_reactivateEvent);  // Reset for next time
         }
@@ -637,11 +660,46 @@ CLIENT_STATUS Client::Initialize(ID3D11Device1* pDevice, float dpiScale)
     // Use Global\ prefix for cross-session access (dwm.exe runs in Session 0)
     m_reactivateEvent = CreateEventA(NULL, TRUE, FALSE, "Global\\RedactedOverlayReactivate");
     
-    // Initialize GPT Helper
+    // Initialize GPT Helper with backend proxy config
     GPTHelper::GPTConfig gptConfig;
-    gptConfig.model = "gpt-4o";
-    gptConfig.maxTokens = 2048;
+    gptConfig.model = "gpt-4o";  // Default fallback until models are fetched
+    gptConfig.backendHost = "secure-bypassify-backend-production.up.railway.app";
+    gptConfig.maxTokens = 10000;
     GPTHelper::Initialize(gptConfig);
+    
+    // Restore saved model selection if we have one
+    const Settings::AppSettings& settings = Settings::Get();
+    if (strlen(settings.selectedModelId) > 0)
+    {
+        gptConfig.model = settings.selectedModelId;
+        GPTHelper::SetModel(settings.selectedModelId);
+    }
+    
+    // Fetch models from backend asynchronously
+    m_modelsFetching = true;
+    GPTHelper::FetchModelsAsync([](bool success)
+    {
+        m_modelsFetching = false;
+        m_modelsFetched = success;
+        
+        if (success)
+        {
+            // If we had a saved model selection, re-apply it now that we have the model list
+            const Settings::AppSettings& settings = Settings::Get();
+            if (strlen(settings.selectedModelId) > 0)
+            {
+                GPTHelper::SetModel(settings.selectedModelId);
+            }
+            
+            fprintf(stderr, "Models loaded: %d available, current: %s\n",
+                (int)GPTHelper::GetModels().size(),
+                GPTHelper::GetCurrentModelDisplayName().c_str());
+        }
+        else
+        {
+            fprintf(stderr, "Failed to fetch models: %s\n", GPTHelper::GetLastError().c_str());
+        }
+    });
     
     return InputInitialize();
 }

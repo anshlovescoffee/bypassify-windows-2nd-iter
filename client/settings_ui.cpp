@@ -5,12 +5,14 @@ Settings UI window implementation
 
 #include "settings_ui.hpp"
 #include "settings.hpp"
+#include "gpthelper.hpp"
 #include "imgui.h"
 #include <windows.h>
+#include <string.h>
 
 static bool g_isOpen = false;
 static bool g_waitingForHotkey = false;
-static int g_editingHotkey = -1; // 0=screenshot, 1=send, 2=toggle, 3=settings, 4=quit
+static int g_editingHotkey = -1; // 0-9 = existing, 10 = model cycle
 static int g_captureFrameDelay = 0; // Wait frames before capturing to avoid triggering action
 
 // Helper to get key name
@@ -124,19 +126,20 @@ static bool IsHotkeyDuplicate(bool ctrl, bool shift, bool alt, int key, int curr
     
     // Array of all hotkeys to check against (excluding quit which is fixed)
     Settings::Hotkey* hotkeys[] = {
-        &settings.hotkeyScreenshot,
-        &settings.hotkeySend,
-        &settings.hotkeyToggle,
-        &settings.hotkeySettings,
-        &settings.hotkeyMoveUp,
-        &settings.hotkeyMoveDown,
-        &settings.hotkeyMoveLeft,
-        &settings.hotkeyMoveRight,
-        &settings.hotkeyScrollUp,
-        &settings.hotkeyScrollDown
+        &settings.hotkeyScreenshot,   // 0
+        &settings.hotkeySend,         // 1
+        &settings.hotkeyToggle,       // 2
+        &settings.hotkeySettings,     // 3
+        &settings.hotkeyMoveUp,       // 4
+        &settings.hotkeyMoveDown,     // 5
+        &settings.hotkeyMoveLeft,     // 6
+        &settings.hotkeyMoveRight,    // 7
+        &settings.hotkeyScrollUp,     // 8
+        &settings.hotkeyScrollDown,   // 9
+        &settings.hotkeyModelCycle    // 10
     };
     
-    for (int i = 0; i < 10; i++)
+    for (int i = 0; i < 11; i++)
     {
         if (i == currentIndex) continue; // Skip the one we're editing
         
@@ -230,7 +233,7 @@ void SettingsUI::Draw()
     
     Settings::AppSettings& settings = Settings::GetMutable();
     
-    ImGui::SetNextWindowSize(ImVec2(450, 670), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(450, 720), ImGuiCond_Always);
     
     // NoCollapse, NoResize so it stays at the forced size
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize;
@@ -238,21 +241,62 @@ void SettingsUI::Draw()
     if (ImGui::Begin("Settings", nullptr, flags))
     {
         // ============================================
-        // API Settings
+        // Model Settings
         // ============================================
-        if (ImGui::CollapsingHeader("API Settings", ImGuiTreeNodeFlags_DefaultOpen))
+        if (ImGui::CollapsingHeader("Model", ImGuiTreeNodeFlags_DefaultOpen))
         {
-            ImGui::Text("OpenAI API Key:");
-            ImGui::PushItemWidth(-1);
-            ImGui::InputText("##SettingsApiKey", settings.apiKey, sizeof(settings.apiKey), ImGuiInputTextFlags_Password);
-            ImGui::PopItemWidth();
+            const auto& models = GPTHelper::GetModels();
             
-            ImGui::Spacing();
-            
-            ImGui::Text("Default Prompt:");
+            if (models.empty())
+            {
+                ImGui::TextColored(ImVec4(0.8f, 0.6f, 0.0f, 1.0f), "Loading models...");
+            }
+            else
+            {
+                ImGui::Text("Current Model:");
+                ImGui::SameLine();
+                
+                // Build combo items
+                int currentIdx = GPTHelper::GetCurrentModelIndex();
+                
+                if (ImGui::BeginCombo("##ModelCombo", GPTHelper::GetCurrentModelDisplayName().c_str()))
+                {
+                    for (int i = 0; i < (int)models.size(); i++)
+                    {
+                        bool isSelected = (i == currentIdx);
+                        std::string label = models[i].displayName + " (" + models[i].provider + ")";
+                        
+                        if (ImGui::Selectable(label.c_str(), isSelected))
+                        {
+                            GPTHelper::SetModelByIndex(i);
+                            // Persist the selection
+                            strncpy(settings.selectedModelId, models[i].id.c_str(), sizeof(settings.selectedModelId) - 1);
+                            settings.selectedModelId[sizeof(settings.selectedModelId) - 1] = '\0';
+                        }
+                        
+                        if (isSelected)
+                            ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
+                
+                ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Use %s to cycle models",
+                    settings.hotkeyModelCycle.ToString().c_str());
+            }
+        }
+        
+        ImGui::Spacing();
+        
+        // ============================================
+        // Prompt Settings
+        // ============================================
+        if (ImGui::CollapsingHeader("Prompt", ImGuiTreeNodeFlags_DefaultOpen))
+        {
+            ImGui::Text("Custom Prompt:");
             ImGui::PushItemWidth(-1);
             ImGui::InputTextMultiline("##SettingsPrompt", settings.prompt, sizeof(settings.prompt), ImVec2(-1, 80));
             ImGui::PopItemWidth();
+            ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Leave empty to use default behavior. Add text for extra instructions.");
         }
         
         ImGui::Spacing();
@@ -292,9 +336,10 @@ void SettingsUI::Draw()
             ImGui::Spacing();
             
             DrawHotkeyButton("Screenshot", settings.hotkeyScreenshot, 0);
-            DrawHotkeyButton("Send to GPT", settings.hotkeySend, 1);
+            DrawHotkeyButton("Send to AI", settings.hotkeySend, 1);
             DrawHotkeyButton("Toggle Overlay", settings.hotkeyToggle, 2);
             DrawHotkeyButton("Open Settings", settings.hotkeySettings, 3);
+            DrawHotkeyButton("Cycle Model", settings.hotkeyModelCycle, 10);
             DrawHotkeyButton("Move Up", settings.hotkeyMoveUp, 4);
             DrawHotkeyButton("Move Down", settings.hotkeyMoveDown, 5);
             DrawHotkeyButton("Move Left", settings.hotkeyMoveLeft, 6);

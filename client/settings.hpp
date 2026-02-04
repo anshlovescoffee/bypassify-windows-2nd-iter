@@ -34,9 +34,9 @@ namespace Settings
     // All application settings
     struct AppSettings
     {
-        // API Settings
+        // API Settings (apiKey kept for backwards compat but no longer used by proxy)
         char apiKey[256] = "";
-        char prompt[1024] = "What do you see in these screenshots? Please describe them.";
+        char prompt[1024] = "";
         
         // Theme
         Theme theme = Theme::Dark;
@@ -57,6 +57,12 @@ namespace Settings
         // Scroll hotkeys
         Hotkey hotkeyScrollUp = { true, false, false, VK_OEM_4 };   // Ctrl+[ (VK_OEM_4 is '[')
         Hotkey hotkeyScrollDown = { true, false, false, VK_OEM_6 }; // Ctrl+] (VK_OEM_6 is ']')
+        
+        // Model cycling hotkey (version 5)
+        Hotkey hotkeyModelCycle = { true, false, false, 'M' };      // Ctrl+M
+        
+        // Selected model ID (version 5) - persisted so user keeps their choice
+        char selectedModelId[128] = "";
         
         // Appearance
         float transparency = 0.0f;  // 0 to 0.85 (0% to 85% transparent)

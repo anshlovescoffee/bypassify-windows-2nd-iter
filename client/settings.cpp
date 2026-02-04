@@ -173,7 +173,7 @@ bool Settings::Save()
     
     // Write magic number and version
     const char magic[] = "BPFY";
-    int version = 4;
+    int version = 5;  // Version 5: added model cycle hotkey + selected model ID
     
     file.write(magic, 4);
     file.write(reinterpret_cast<const char*>(&version), sizeof(version));
@@ -201,6 +201,10 @@ bool Settings::Save()
     // Write scroll hotkeys (version 4)
     file.write(reinterpret_cast<const char*>(&g_settings.hotkeyScrollUp), sizeof(Hotkey));
     file.write(reinterpret_cast<const char*>(&g_settings.hotkeyScrollDown), sizeof(Hotkey));
+    
+    // Write model cycle hotkey + selected model ID (version 5)
+    file.write(reinterpret_cast<const char*>(&g_settings.hotkeyModelCycle), sizeof(Hotkey));
+    file.write(g_settings.selectedModelId, sizeof(g_settings.selectedModelId));
     
     // Write appearance
     file.write(reinterpret_cast<const char*>(&g_settings.transparency), sizeof(float));
@@ -238,7 +242,7 @@ bool Settings::Load()
     int version;
     file.read(reinterpret_cast<char*>(&version), sizeof(version));
     
-    if (version < 1 || version > 4)
+    if (version < 1 || version > 5)
     {
         file.close();
         return false;
@@ -278,6 +282,13 @@ bool Settings::Load()
     {
         file.read(reinterpret_cast<char*>(&g_settings.hotkeyScrollUp), sizeof(Hotkey));
         file.read(reinterpret_cast<char*>(&g_settings.hotkeyScrollDown), sizeof(Hotkey));
+    }
+    
+    // Version 5 added model cycle hotkey + selected model ID
+    if (version >= 5)
+    {
+        file.read(reinterpret_cast<char*>(&g_settings.hotkeyModelCycle), sizeof(Hotkey));
+        file.read(g_settings.selectedModelId, sizeof(g_settings.selectedModelId));
     }
     
     // Read appearance
